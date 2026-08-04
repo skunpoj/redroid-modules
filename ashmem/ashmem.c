@@ -25,6 +25,7 @@
 #include <linux/bitops.h>
 #include <linux/mutex.h>
 #include <linux/shmem_fs.h>
+#include <linux/sched/mm.h>
 #include "ashmem.h"
 #include "deps.h"
 
@@ -373,7 +374,7 @@ ashmem_vmfile_get_unmapped_area(struct file *file, unsigned long addr,
 				unsigned long len, unsigned long pgoff,
 				unsigned long flags)
 {
-	return current->mm->get_unmapped_area(file, addr, len, pgoff, flags);
+	return mm_get_unmapped_area(current->mm, file, addr, len, pgoff, flags);
 }
 
 static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
@@ -402,7 +403,7 @@ static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
 		ret = -EPERM;
 		goto out;
 	}
-	vma->vm_flags &= ~calc_vm_may_flags(~asma->prot_mask);
+	vm_flags_clear(vma, calc_vm_may_flags(~asma->prot_mask));
 
 	if (!asma->file) {
 		char *name = ASHMEM_NAME_DEF;
@@ -528,6 +529,14 @@ ashmem_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 	return lru_count;
 }
 
+/* The shrinker registration API was reworked in 6.7 (all shrinkers become
+ * dynamically allocated; register_shrinker()/unregister_shrinker() on a
+ * static struct were removed in favour of shrinker_alloc()/
+ * shrinker_register()/shrinker_free() on a pointer). Keep both paths. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+static struct shrinker *ashmem_shrinker;
+#define ASHMEM_SHRINKER_PTR ashmem_shrinker
+#else
 static struct shrinker ashmem_shrinker = {
 	.count_objects = ashmem_shrink_count,
 	.scan_objects = ashmem_shrink_scan,
@@ -537,6 +546,8 @@ static struct shrinker ashmem_shrinker = {
 	 */
 	.seeks = DEFAULT_SEEKS * 4,
 };
+#define ASHMEM_SHRINKER_PTR (&ashmem_shrinker)
+#endif
 
 static int set_prot_mask(struct ashmem_area *asma, unsigned long prot)
 {
@@ -857,8 +868,8 @@ static long ashmem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				.gfp_mask = GFP_KERNEL,
 				.nr_to_scan = LONG_MAX,
 			};
-			ret = ashmem_shrink_count(&ashmem_shrinker, &sc);
-			ashmem_shrink_scan(&ashmem_shrinker, &sc);
+			ret = ashmem_shrink_count(ASHMEM_SHRINKER_PTR, &sc);
+			ashmem_shrink_scan(ASHMEM_SHRINKER_PTR, &sc);
 		}
 		break;
 	}
@@ -947,11 +958,24 @@ static int __init ashmem_init(void)
 		goto out_free2;
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+	ashmem_shrinker = shrinker_alloc(0, "ashmem-shrinker");
+	if (!ashmem_shrinker) {
+		ret = -ENOMEM;
+		pr_err("failed to allocate shrinker!\n");
+		goto out_demisc;
+	}
+	ashmem_shrinker->count_objects = ashmem_shrink_count;
+	ashmem_shrinker->scan_objects = ashmem_shrink_scan;
+	ashmem_shrinker->seeks = DEFAULT_SEEKS * 4;
+	shrinker_register(ashmem_shrinker);
+#else
 	ret = register_shrinker(&ashmem_shrinker);
 	if (ret) {
 		pr_err("failed to register shrinker!\n");
 		goto out_demisc;
 	}
+#endif
 
 	pr_info("initialized\n");
 
@@ -970,7 +994,11 @@ out:
 // HACKED
 static void __exit ashmem_exit(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+	shrinker_free(ashmem_shrinker);
+#else
 	unregister_shrinker(&ashmem_shrinker);
+#endif
 
 	misc_deregister(&ashmem_misc);
 
