@@ -21,13 +21,12 @@ static inline void vm_flags_clear(struct vm_area_struct *vma, unsigned long flag
 #endif
 
 /* mm->get_unmapped_area (a function pointer member on struct mm_struct)
- * was replaced by the free function mm_get_unmapped_area() as part of the
- * same era of mm rework. Verified present with this exact signature on
- * 6.17; NOT independently verified on which earlier release first
- * introduced it, so this boundary is a best-effort estimate grouped with
- * the vm_flags change above, not confirmed against kernel history the
- * way that one is - please adjust if CI/testing shows otherwise. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+ * was replaced by the free function mm_get_unmapped_area() in commit
+ * 529ce23a764f ("mm: switch mm->get_unmapped_area() to a flag"),
+ * confirmed via upstream history to be an ancestor of v6.10 but NOT of
+ * v6.9 - i.e. introduced in 6.10, not grouped with the 6.3 vm_flags
+ * change below despite landing in the same broad era of mm rework. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 static inline unsigned long mm_get_unmapped_area(struct mm_struct *mm,
 		struct file *file, unsigned long addr, unsigned long len,
 		unsigned long pgoff, unsigned long flags)
