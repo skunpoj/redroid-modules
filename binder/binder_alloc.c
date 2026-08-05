@@ -28,6 +28,55 @@
 
 struct list_lru binder_alloc_lru;
 
+
+/* ---- kernel 6.x compatibility shims ---- */
+#include <linux/version.h>
+
+/* mm->mmap_sem was renamed mmap_lock with its own accessors in 5.8
+ * (commit da1c55f1b272). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+#define BINDER_MM_READ_LOCK(mm)		mmap_read_lock(mm)
+#define BINDER_MM_READ_TRYLOCK(mm)	mmap_read_trylock(mm)
+#define BINDER_MM_READ_UNLOCK(mm)	mmap_read_unlock(mm)
+#else
+#define BINDER_MM_READ_LOCK(mm)		down_read(&(mm)->mmap_sem)
+#define BINDER_MM_READ_TRYLOCK(mm)	down_read_trylock(&(mm)->mmap_sem)
+#define BINDER_MM_READ_UNLOCK(mm)	up_read(&(mm)->mmap_sem)
+#endif
+
+/* list_lru_add()/list_lru_del() gained explicit nid + memcg arguments in 6.6
+ * (commit 3f7be6a1ce2e). The _obj() wrappers derive both from the object, which
+ * is exactly what the old two-arg calls did implicitly. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define BINDER_LRU_ADD(lru, item)	list_lru_add_obj(lru, item)
+#define BINDER_LRU_DEL(lru, item)	list_lru_del_obj(lru, item)
+#else
+#define BINDER_LRU_ADD(lru, item)	list_lru_add(lru, item)
+#define BINDER_LRU_DEL(lru, item)	list_lru_del(lru, item)
+#endif
+
+/* zap_page_range() was removed in 6.3 in favour of zap_page_range_single()
+ * (commit e9adcfecf572), which takes an extra details argument. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define BINDER_ZAP_PAGE(vma, addr, size)	\
+	zap_page_range_single(vma, addr, size, NULL)
+#else
+#define BINDER_ZAP_PAGE(vma, addr, size)	zap_page_range(vma, addr, size)
+#endif
+
+/* The shrinker API was reworked in 6.7: shrinkers are dynamically allocated
+ * and registered via shrinker_alloc()/shrinker_register()/shrinker_free()
+ * instead of a static struct passed to register_shrinker(). This mirrors the
+ * change already made to ashmem in this repo. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+static struct shrinker *binder_shrinker;
+#define BINDER_SHRINKER_PTR	binder_shrinker
+#else
+static struct shrinker binder_shrinker_s;
+#define BINDER_SHRINKER_PTR	(&binder_shrinker_s)
+#endif
+/* ---- end compatibility shims ---- */
+
 static DEFINE_MUTEX(binder_alloc_mmap_lock);
 
 enum {
@@ -213,7 +262,7 @@ static int binder_update_page_range(struct binder_alloc *alloc, int allocate,
 		mm = alloc->vma_vm_mm;
 
 	if (mm) {
-		down_read(&mm->mmap_sem);
+		BINDER_MM_READ_LOCK(mm);
 		vma = alloc->vma;
 	}
 
@@ -235,7 +284,7 @@ static int binder_update_page_range(struct binder_alloc *alloc, int allocate,
 		if (page->page_ptr) {
 			trace_binder_alloc_lru_start(alloc, index);
 
-			on_lru = list_lru_del(&binder_alloc_lru, &page->lru);
+			on_lru = BINDER_LRU_DEL(&binder_alloc_lru, &page->lru);
 			WARN_ON(!on_lru);
 
 			trace_binder_alloc_lru_end(alloc, index);
@@ -272,7 +321,7 @@ static int binder_update_page_range(struct binder_alloc *alloc, int allocate,
 		/* vm_insert_page does not seem to increment the refcount */
 	}
 	if (mm) {
-		up_read(&mm->mmap_sem);
+		BINDER_MM_READ_UNLOCK(mm);
 		mmput(mm);
 	}
 	return 0;
@@ -287,7 +336,7 @@ free_range:
 
 		trace_binder_free_lru_start(alloc, index);
 
-		ret = list_lru_add(&binder_alloc_lru, &page->lru);
+		ret = BINDER_LRU_ADD(&binder_alloc_lru, &page->lru);
 		WARN_ON(!ret);
 
 		trace_binder_free_lru_end(alloc, index);
@@ -305,7 +354,7 @@ err_page_ptr_cleared:
 	}
 err_no_vma:
 	if (mm) {
-		up_read(&mm->mmap_sem);
+		BINDER_MM_READ_UNLOCK(mm);
 		mmput(mm);
 	}
 	return vma ? -ENOMEM : -ESRCH;
@@ -779,7 +828,7 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 			if (!alloc->pages[i].page_ptr)
 				continue;
 
-			on_lru = list_lru_del(&binder_alloc_lru,
+			on_lru = BINDER_LRU_DEL(&binder_alloc_lru,
 					      &alloc->pages[i].lru);
 			page_addr = alloc->buffer + i * PAGE_SIZE;
 			binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
@@ -906,11 +955,25 @@ void binder_alloc_vma_close(struct binder_alloc *alloc)
  * Called from list_lru_walk() in binder_shrink_scan() to free
  * up pages when the system is under memory pressure.
  */
+/* The list_lru walk callback lost its explicit `spinlock_t *lock` argument
+ * in 6.13 (commit fb56fdf8b9a2) -- the lock now lives inside struct
+ * list_lru_one and is reached as &lru->lock. Keep both shapes so older
+ * kernels are unaffected; BINDER_LRU_LOCK() below resolves to the right one.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#define BINDER_LRU_LOCK()	(&lru->lock)
+enum lru_status binder_alloc_free_page(struct list_head *item,
+				       struct list_lru_one *lru,
+				       void *cb_arg)
+	__must_hold(&lru->lock)
+#else
+#define BINDER_LRU_LOCK()	(lock)
 enum lru_status binder_alloc_free_page(struct list_head *item,
 				       struct list_lru_one *lru,
 				       spinlock_t *lock,
 				       void *cb_arg)
 	__must_hold(lock)
+#endif
 {
 	struct mm_struct *mm = NULL;
 	struct binder_lru_page *page = container_of(item,
@@ -934,21 +997,21 @@ enum lru_status binder_alloc_free_page(struct list_head *item,
 	mm = alloc->vma_vm_mm;
 	if (!mmget_not_zero(mm))
 		goto err_mmget;
-	if (!down_read_trylock(&mm->mmap_sem))
+	if (!BINDER_MM_READ_TRYLOCK(mm))
 		goto err_down_read_mmap_sem_failed;
 	vma = binder_alloc_get_vma(alloc);
 
 	list_lru_isolate(lru, item);
-	spin_unlock(lock);
+	spin_unlock(BINDER_LRU_LOCK());
 
 	if (vma) {
 		trace_binder_unmap_user_start(alloc, index);
 
-		zap_page_range(vma, page_addr, PAGE_SIZE);
+		BINDER_ZAP_PAGE(vma, page_addr, PAGE_SIZE);
 
 		trace_binder_unmap_user_end(alloc, index);
 	}
-	up_read(&mm->mmap_sem);
+	BINDER_MM_READ_UNLOCK(mm);
 	mmput_async(mm);
 
 	trace_binder_unmap_kernel_start(alloc, index);
@@ -958,7 +1021,7 @@ enum lru_status binder_alloc_free_page(struct list_head *item,
 
 	trace_binder_unmap_kernel_end(alloc, index);
 
-	spin_lock(lock);
+	spin_lock(BINDER_LRU_LOCK());
 	mutex_unlock(&alloc->mutex);
 	return LRU_REMOVED_RETRY;
 
@@ -988,11 +1051,13 @@ binder_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 	return ret;
 }
 
-static struct shrinker binder_shrinker = {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 7, 0)
+static struct shrinker binder_shrinker_s = {
 	.count_objects = binder_shrink_count,
 	.scan_objects = binder_shrink_scan,
 	.seeks = DEFAULT_SEEKS,
 };
+#endif
 
 /**
  * binder_alloc_init() - called by binder_open() for per-proc initialization
@@ -1013,9 +1078,21 @@ int binder_alloc_shrinker_init(void)
 	int ret = list_lru_init(&binder_alloc_lru);
 
 	if (ret == 0) {
-		ret = register_shrinker(&binder_shrinker);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+		binder_shrinker = shrinker_alloc(0, "android-binder");
+		if (!binder_shrinker) {
+			list_lru_destroy(&binder_alloc_lru);
+			return -ENOMEM;
+		}
+		binder_shrinker->count_objects = binder_shrink_count;
+		binder_shrinker->scan_objects = binder_shrink_scan;
+		binder_shrinker->seeks = DEFAULT_SEEKS;
+		shrinker_register(binder_shrinker);
+#else
+		ret = register_shrinker(&binder_shrinker_s);
 		if (ret)
 			list_lru_destroy(&binder_alloc_lru);
+#endif
 	}
 	return ret;
 }
@@ -1023,7 +1100,11 @@ int binder_alloc_shrinker_init(void)
 // HACKED
 void binder_alloc_shrinker_exit(void)
 {
-	unregister_shrinker(&binder_shrinker);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+	shrinker_free(binder_shrinker);
+#else
+	unregister_shrinker(&binder_shrinker_s);
+#endif
 	list_lru_destroy(&binder_alloc_lru);
 }
 

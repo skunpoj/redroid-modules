@@ -112,9 +112,16 @@ void binder_selftest_alloc(struct binder_alloc *alloc);
 #else
 static inline void binder_selftest_alloc(struct binder_alloc *alloc) {}
 #endif
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+enum lru_status binder_alloc_free_page(struct list_head *item,
+				       struct list_lru_one *lru,
+				       void *cb_arg);
+#else
 enum lru_status binder_alloc_free_page(struct list_head *item,
 				       struct list_lru_one *lru,
 				       spinlock_t *lock, void *cb_arg);
+#endif
 extern struct binder_buffer *binder_alloc_new_buf(struct binder_alloc *alloc,
 						  size_t data_size,
 						  size_t offsets_size,

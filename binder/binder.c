@@ -76,6 +76,159 @@
 #include "binder_internal.h"
 #include "binder_trace.h"
 
+
+/* ---- kernel 6.x compatibility shims (added for modern-kernel build) ----
+ *
+ * These are grouped so the call sites below stay readable. Each is guarded so
+ * older kernels compile byte-identically to before.
+ */
+#include <linux/version.h>
+
+/* __close_fd_get_file() was renamed close_fd_get_file() and changed to RETURN
+ * the file rather than fill an out-param (5.11, commit 9fe83c43e71c). */
+/* 6.7 renamed it again to file_close_fd() and, importantly, that is the one
+ * actually declared in <linux/fdtable.h> for modules -- close_fd_get_file()
+ * moved to fs/internal.h and is NOT reachable from an out-of-tree module. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+#define BINDER_CLOSE_FD_GET_FILE(fd, filep)	(*(filep) = file_close_fd(fd))
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#define BINDER_CLOSE_FD_GET_FILE(fd, filep)	(*(filep) = close_fd_get_file(fd))
+#else
+#define BINDER_CLOSE_FD_GET_FILE(fd, filep)	__close_fd_get_file(fd, filep)
+#endif
+
+/* The security_binder_* hooks take a `const struct cred *` from 6.0 onward
+ * (commit 52f8873d5b8b) instead of a `struct task_struct *`. Upstream binder
+ * gained a proc->cred member for this; this out-of-tree copy has not, so read
+ * the task's cred under RCU. That is sound HERE specifically because these
+ * hooks only INSPECT the cred to make an access decision -- they never store
+ * it -- so no reference needs to be taken beyond the RCU read section.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+static inline int binder_sec_transfer_binder(struct task_struct *from,
+					     struct task_struct *to)
+{
+	int r;
+
+	rcu_read_lock();
+	r = security_binder_transfer_binder(__task_cred(from), __task_cred(to));
+	rcu_read_unlock();
+	return r;
+}
+
+static inline int binder_sec_transfer_file(struct task_struct *from,
+					   struct task_struct *to,
+					   struct file *file)
+{
+	int r;
+
+	rcu_read_lock();
+	r = security_binder_transfer_file(__task_cred(from), __task_cred(to),
+					  file);
+	rcu_read_unlock();
+	return r;
+}
+
+static inline int binder_sec_transaction(struct task_struct *from,
+					 struct task_struct *to)
+{
+	int r;
+
+	rcu_read_lock();
+	r = security_binder_transaction(__task_cred(from), __task_cred(to));
+	rcu_read_unlock();
+	return r;
+}
+
+static inline int binder_sec_set_context_mgr(struct task_struct *mgr)
+{
+	int r;
+
+	rcu_read_lock();
+	r = security_binder_set_context_mgr(__task_cred(mgr));
+	rcu_read_unlock();
+	return r;
+}
+#else
+#define binder_sec_transfer_binder(f, t)	security_binder_transfer_binder(f, t)
+#define binder_sec_transfer_file(f, t, fl)	security_binder_transfer_file(f, t, fl)
+#define binder_sec_transaction(f, t)		security_binder_transaction(f, t)
+#define binder_sec_set_context_mgr(m)		security_binder_set_context_mgr(m)
+#endif
+
+/* secctx handling moved to `struct lsm_context` (6.13, commit 8e7ec5ca4dbe):
+ * security_secid_to_secctx() now fills one, and security_release_secctx()
+ * takes it, instead of a (char *, u32) pair. security_task_getsecid() was
+ * likewise replaced by security_cred_getsecid(). Keep the file's existing
+ * `secctx` / `secctx_sz` locals working by copying out of the context.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+static inline int binder_get_secctx(struct task_struct *tsk, char **secctx,
+				    u32 *secctx_sz)
+{
+	struct lsm_context ctx = {};
+	u32 secid = 0;
+	int ret;
+
+	rcu_read_lock();
+	security_cred_getsecid(__task_cred(tsk), &secid);
+	rcu_read_unlock();
+
+	ret = security_secid_to_secctx(secid, &ctx);
+	if (ret)
+		return ret;
+	*secctx = ctx.context;
+	*secctx_sz = ctx.len;
+	return 0;
+}
+
+static inline void binder_put_secctx(char *ctxbuf, u32 ctxlen)
+{
+	struct lsm_context ctx = { .context = ctxbuf, .len = ctxlen };
+
+	security_release_secctx(&ctx);
+}
+#else
+static inline int binder_get_secctx(struct task_struct *tsk, char **secctx,
+				    u32 *secctx_sz)
+{
+	u32 secid = 0;
+
+	security_task_getsecid(tsk, &secid);
+	return security_secid_to_secctx(secid, secctx, secctx_sz);
+}
+
+static inline void binder_put_secctx(char *ctxbuf, u32 ctxlen)
+{
+	security_release_secctx(ctxbuf, ctxlen);
+}
+#endif
+
+/* freezer_do_not_count()/freezer_count() were removed in 6.1 when freezing
+ * moved to TASK_FREEZABLE (commit f5d39b020809); the surrounding wait is
+ * already interruptible, so on modern kernels these simply go away. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+#define binder_freezer_do_not_count()	do { } while (0)
+#define binder_freezer_count()		do { } while (0)
+#else
+#define binder_freezer_do_not_count()	freezer_do_not_count()
+#define binder_freezer_count()		freezer_count()
+#endif
+
+/* vma->vm_flags became read-only in 6.3 (commit bc292ab00f6c). */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+static inline void vm_flags_set(struct vm_area_struct *vma, unsigned long f)
+{
+	vma->vm_flags |= f;
+}
+
+static inline void vm_flags_clear(struct vm_area_struct *vma, unsigned long f)
+{
+	vma->vm_flags &= ~f;
+}
+#endif
+/* ---- end compatibility shims ---- */
+
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 
@@ -2232,7 +2385,7 @@ static void binder_deferred_fd_close(int fd)
 	if (!twcb)
 		return;
 	init_task_work(&twcb->twork, binder_do_fd_close);
-	__close_fd_get_file(fd, &twcb->file);
+	BINDER_CLOSE_FD_GET_FILE(fd, &twcb->file);
 	if (twcb->file)
 		task_work_add(current, &twcb->twork, true);
 	else
@@ -2435,7 +2588,7 @@ static int binder_translate_binder(struct flat_binder_object *fp,
 		ret = -EINVAL;
 		goto done;
 	}
-	if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
+	if (binder_sec_transfer_binder(proc->tsk, target_proc->tsk)) {
 		ret = -EPERM;
 		goto done;
 	}
@@ -2481,7 +2634,7 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 				  proc->pid, thread->pid, fp->handle);
 		return -EINVAL;
 	}
-	if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
+	if (binder_sec_transfer_binder(proc->tsk, target_proc->tsk)) {
 		ret = -EPERM;
 		goto done;
 	}
@@ -2569,7 +2722,7 @@ static int binder_translate_fd(u32 fd, binder_size_t fd_offset,
 		ret = -EBADF;
 		goto err_fget;
 	}
-	ret = security_binder_transfer_file(proc->tsk, target_proc->tsk, file);
+	ret = binder_sec_transfer_file(proc->tsk, target_proc->tsk, file);
 	if (ret < 0) {
 		ret = -EPERM;
 		goto err_security;
@@ -2968,8 +3121,8 @@ static void binder_transaction(struct binder_proc *proc,
 			return_error_line = __LINE__;
 			goto err_invalid_target_handle;
 		}
-		if (security_binder_transaction(proc->tsk,
-						target_proc->tsk) < 0) {
+		if (binder_sec_transaction(proc->tsk,
+					       target_proc->tsk) < 0) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPERM;
 			return_error_line = __LINE__;
@@ -3092,11 +3245,9 @@ static void binder_transaction(struct binder_proc *proc,
 	t->priority = task_nice(current);
 
 	if (target_node && target_node->txn_security_ctx) {
-		u32 secid;
 		size_t added_size;
 
-		security_task_getsecid(proc->tsk, &secid);
-		ret = security_secid_to_secctx(secid, &secctx, &secctx_sz);
+		ret = binder_get_secctx(proc->tsk, &secctx, &secctx_sz);
 		if (ret) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = ret;
@@ -3145,7 +3296,7 @@ static void binder_transaction(struct binder_proc *proc,
 			t->security_ctx = 0;
 			WARN_ON(1);
 		}
-		security_release_secctx(secctx, secctx_sz);
+		binder_put_secctx(secctx, secctx_sz);
 		secctx = NULL;
 	}
 	t->buffer->debug_id = t->debug_id;
@@ -3479,7 +3630,7 @@ err_copy_data_failed:
 err_binder_alloc_buf_failed:
 err_bad_extra_size:
 	if (secctx)
-		security_release_secctx(secctx, secctx_sz);
+		binder_put_secctx(secctx, secctx_sz);
 err_get_secctx_failed:
 	kfree(tcomplete);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION_COMPLETE);
@@ -4073,7 +4224,7 @@ static int binder_wait_for_work(struct binder_thread *thread,
 	struct binder_proc *proc = thread->proc;
 	int ret = 0;
 
-	freezer_do_not_count();
+	binder_freezer_do_not_count();
 	binder_inner_proc_lock(proc);
 	for (;;) {
 		prepare_to_wait(&thread->wait, &wait, TASK_INTERRUPTIBLE);
@@ -4093,7 +4244,7 @@ static int binder_wait_for_work(struct binder_thread *thread,
 	}
 	finish_wait(&thread->wait, &wait);
 	binder_inner_proc_unlock(proc);
-	freezer_count();
+	binder_freezer_count();
 
 	return ret;
 }
@@ -4906,7 +5057,7 @@ static int binder_ioctl_set_ctx_mgr(struct file *filp,
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = security_binder_set_context_mgr(proc->tsk);
+	ret = binder_sec_set_context_mgr(proc->tsk);
 	if (ret < 0)
 		goto out;
 	if (uid_valid(context->binder_context_mgr_uid)) {
@@ -5188,8 +5339,8 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 		failure_string = "bad vm_flags";
 		goto err_bad_arg;
 	}
-	vma->vm_flags |= VM_DONTCOPY | VM_MIXEDMAP;
-	vma->vm_flags &= ~VM_MAYWRITE;
+	vm_flags_set(vma, VM_DONTCOPY | VM_MIXEDMAP);
+	vm_flags_clear(vma, VM_MAYWRITE);
 
 	vma->vm_ops = &binder_vm_ops;
 	vma->vm_private_data = proc;
