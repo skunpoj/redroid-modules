@@ -30,6 +30,17 @@
 #include <linux/uaccess.h>
 #include <linux/user_namespace.h>
 #include <linux/version.h>
+
+/* lookup_one_len() was removed in 6.15 in favour of lookup_noperm(), which
+ * takes a struct qstr instead of a (name, len) pair -- same "no permission
+ * check" semantics, so this is a direct translation rather than a behaviour
+ * change. QSTR_LEN() builds the qstr inline. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+#define BINDERFS_LOOKUP(name, base, len)	\
+	lookup_noperm(&QSTR_LEN(name, len), base)
+#else
+#define BINDERFS_LOOKUP(name, base, len)	lookup_one_len(name, base, len)
+#endif
 #include <linux/xarray.h>
 #include <uapi/asm-generic/errno-base.h>
 #include "uapi/linux/android/binder.h"
@@ -191,7 +202,7 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
 	inode_lock(d_inode(root));
 
 	/* look it up */
-	dentry = lookup_one_len(name, root, name_len);
+	dentry = BINDERFS_LOOKUP(name, root, name_len);
 	if (IS_ERR(dentry)) {
 		inode_unlock(d_inode(root));
 		ret = PTR_ERR(dentry);
@@ -546,7 +557,7 @@ static struct dentry *binderfs_create_dentry(struct dentry *parent,
 {
 	struct dentry *dentry;
 
-	dentry = lookup_one_len(name, parent, strlen(name));
+	dentry = BINDERFS_LOOKUP(name, parent, strlen(name));
 	if (IS_ERR(dentry))
 		return dentry;
 
