@@ -29,6 +29,7 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/user_namespace.h>
+#include <linux/version.h>
 #include <linux/xarray.h>
 #include <uapi/asm-generic/errno-base.h>
 #include "uapi/linux/android/binder.h"
@@ -43,6 +44,21 @@
 #define BINDERFS_MAX_MINOR (1U << MINORBITS)
 /* Ensure that the initial ipc namespace always has devices available. */
 #define BINDERFS_MAX_MINOR_CAPPED (BINDERFS_MAX_MINOR - 4)
+
+/* struct inode's timestamp fields were removed in favour of accessors: i_ctime
+ * in 6.6 (commit 13bc24457850, "fs: rename i_ctime field to __i_ctime") and
+ * i_atime/i_mtime in 6.11 (commit 8d3e29143560 et al). simple_inode_init_ts()
+ * sets all three at once and exists from 6.7, so use it where available and
+ * fall back to the direct assignment on older kernels. Without this the module
+ * fails with 12 errors -- "struct inode has no member named i_mtime" and
+ * friends -- across four sites that all did the same thing.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+#define BINDERFS_INIT_TS(ino)	simple_inode_init_ts(ino)
+#else
+#define BINDERFS_INIT_TS(ino) \
+	((ino)->i_mtime = (ino)->i_atime = (ino)->i_ctime = current_time(ino))
+#endif
 
 extern struct ipc_namespace* get_init_ipc_ns_ptr(void);
 static dev_t binderfs_dev;
@@ -141,7 +157,7 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
 		goto err;
 
 	inode->i_ino = minor + INODE_OFFSET;
-	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
+	BINDERFS_INIT_TS(inode);
 	init_special_inode(inode, S_IFCHR | 0600,
 			   MKDEV(MAJOR(binderfs_dev), minor));
 	inode->i_fop = &binder_fops;
@@ -364,6 +380,41 @@ static inline bool is_binderfs_control_device(const struct dentry *dentry)
 	return info->control_dentry == dentry;
 }
 
+/* Both the ->rename inode_operation and simple_rename() gained a leading
+ * `struct mnt_idmap *` in 6.3 (commit e18275ae55e0, "fs: port ->rename() to
+ * pass mnt_idmap"), replacing the `struct user_namespace *` that 5.12 had
+ * introduced for the same purpose. Building without this on 6.3+ fails as
+ * "control reaches end of non-void function" at the closing brace -- the
+ * misleading symptom of simple_rename() being called with the wrong arity,
+ * not a genuinely missing return.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int binderfs_rename(struct mnt_idmap *idmap,
+			   struct inode *old_dir, struct dentry *old_dentry,
+			   struct inode *new_dir, struct dentry *new_dentry,
+			   unsigned int flags)
+{
+	if (is_binderfs_control_device(old_dentry) ||
+	    is_binderfs_control_device(new_dentry))
+		return -EPERM;
+
+	return simple_rename(idmap, old_dir, old_dentry, new_dir, new_dentry,
+			     flags);
+}
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+static int binderfs_rename(struct user_namespace *mnt_userns,
+			   struct inode *old_dir, struct dentry *old_dentry,
+			   struct inode *new_dir, struct dentry *new_dentry,
+			   unsigned int flags)
+{
+	if (is_binderfs_control_device(old_dentry) ||
+	    is_binderfs_control_device(new_dentry))
+		return -EPERM;
+
+	return simple_rename(mnt_userns, old_dir, old_dentry, new_dir,
+			     new_dentry, flags);
+}
+#else
 static int binderfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 			   struct inode *new_dir, struct dentry *new_dentry,
 			   unsigned int flags)
@@ -374,6 +425,7 @@ static int binderfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	return simple_rename(old_dir, old_dentry, new_dir, new_dentry, flags);
 }
+#endif
 
 static int binderfs_unlink(struct inode *dir, struct dentry *dentry)
 {
@@ -442,7 +494,7 @@ static int binderfs_binder_ctl_create(struct super_block *sb)
 	}
 
 	inode->i_ino = SECOND_INODE;
-	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
+	BINDERFS_INIT_TS(inode);
 	init_special_inode(inode, S_IFCHR | 0600,
 			   MKDEV(MAJOR(binderfs_dev), minor));
 	inode->i_fop = &binder_ctl_fops;
@@ -484,7 +536,7 @@ static struct inode *binderfs_make_inode(struct super_block *sb, int mode)
 	if (ret) {
 		ret->i_ino = iunique(sb, BINDERFS_MAX_MINOR + INODE_OFFSET);
 		ret->i_mode = mode;
-		ret->i_atime = ret->i_mtime = ret->i_ctime = current_time(ret);
+		BINDERFS_INIT_TS(ret);
 	}
 	return ret;
 }
@@ -708,7 +760,7 @@ static int binderfs_fill_super(struct super_block *sb, void *data, int silent)
 	inode->i_ino = FIRST_INODE;
 	inode->i_fop = &simple_dir_operations;
 	inode->i_mode = S_IFDIR | 0755;
-	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
+	BINDERFS_INIT_TS(inode);
 	inode->i_op = &binderfs_dir_inode_operations;
 	set_nlink(inode, 2);
 
