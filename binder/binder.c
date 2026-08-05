@@ -105,50 +105,14 @@
  * it -- so no reference needs to be taken beyond the RCU read section.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-static inline int binder_sec_transfer_binder(struct task_struct *from,
-					     struct task_struct *to)
-{
-	int r;
-
-	rcu_read_lock();
-	r = security_binder_transfer_binder(__task_cred(from), __task_cred(to));
-	rcu_read_unlock();
-	return r;
-}
-
-static inline int binder_sec_transfer_file(struct task_struct *from,
-					   struct task_struct *to,
-					   struct file *file)
-{
-	int r;
-
-	rcu_read_lock();
-	r = security_binder_transfer_file(__task_cred(from), __task_cred(to),
-					  file);
-	rcu_read_unlock();
-	return r;
-}
-
-static inline int binder_sec_transaction(struct task_struct *from,
-					 struct task_struct *to)
-{
-	int r;
-
-	rcu_read_lock();
-	r = security_binder_transaction(__task_cred(from), __task_cred(to));
-	rcu_read_unlock();
-	return r;
-}
-
-static inline int binder_sec_set_context_mgr(struct task_struct *mgr)
-{
-	int r;
-
-	rcu_read_lock();
-	r = security_binder_set_context_mgr(__task_cred(mgr));
-	rcu_read_unlock();
-	return r;
-}
+#define binder_sec_transfer_binder(f, t)	\
+	security_binder_transfer_binder(f, t)
+#define binder_sec_transfer_file(f, t, fl)	\
+	security_binder_transfer_file(f, t, fl)
+#define binder_sec_transaction(f, t)		\
+	security_binder_transaction(f, t)
+#define binder_sec_set_context_mgr(m)		\
+	security_binder_set_context_mgr(m)
 #else
 #define binder_sec_transfer_binder(f, t)	security_binder_transfer_binder(f, t)
 #define binder_sec_transfer_file(f, t, fl)	security_binder_transfer_file(f, t, fl)
@@ -163,16 +127,14 @@ static inline int binder_sec_set_context_mgr(struct task_struct *mgr)
  * `secctx` / `secctx_sz` locals working by copying out of the context.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-static inline int binder_get_secctx(struct task_struct *tsk, char **secctx,
+static inline int binder_get_secctx(const struct cred *cred, char **secctx,
 				    u32 *secctx_sz)
 {
 	struct lsm_context ctx = {};
 	u32 secid = 0;
 	int ret;
 
-	rcu_read_lock();
-	security_cred_getsecid(__task_cred(tsk), &secid);
-	rcu_read_unlock();
+	security_cred_getsecid(cred, &secid);
 
 	ret = security_secid_to_secctx(secid, &ctx);
 	if (ret)
@@ -623,6 +585,16 @@ struct binder_proc {
 	struct list_head waiting_threads;
 	int pid;
 	struct task_struct *tsk;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+	/* The security_binder_* hooks take a const struct cred * from 6.0
+	 * (commit 52f8873d5b8b). Hold a reference for the proc's whole
+	 * lifetime, exactly as upstream binder does, rather than reading
+	 * current->cred at each call site -- the opening task can exit while
+	 * the proc is still alive, so a borrowed pointer would be a
+	 * use-after-free waiting to happen.
+	 */
+	const struct cred *cred;
+#endif
 	struct hlist_node deferred_work_node;
 	int deferred_work;
 	bool is_dead;
@@ -2588,7 +2560,7 @@ static int binder_translate_binder(struct flat_binder_object *fp,
 		ret = -EINVAL;
 		goto done;
 	}
-	if (binder_sec_transfer_binder(proc->tsk, target_proc->tsk)) {
+	if (binder_sec_transfer_binder(proc->cred, target_proc->cred)) {
 		ret = -EPERM;
 		goto done;
 	}
@@ -2634,7 +2606,7 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 				  proc->pid, thread->pid, fp->handle);
 		return -EINVAL;
 	}
-	if (binder_sec_transfer_binder(proc->tsk, target_proc->tsk)) {
+	if (binder_sec_transfer_binder(proc->cred, target_proc->cred)) {
 		ret = -EPERM;
 		goto done;
 	}
@@ -2722,7 +2694,7 @@ static int binder_translate_fd(u32 fd, binder_size_t fd_offset,
 		ret = -EBADF;
 		goto err_fget;
 	}
-	ret = binder_sec_transfer_file(proc->tsk, target_proc->tsk, file);
+	ret = binder_sec_transfer_file(proc->cred, target_proc->cred, file);
 	if (ret < 0) {
 		ret = -EPERM;
 		goto err_security;
@@ -3121,8 +3093,8 @@ static void binder_transaction(struct binder_proc *proc,
 			return_error_line = __LINE__;
 			goto err_invalid_target_handle;
 		}
-		if (binder_sec_transaction(proc->tsk,
-					       target_proc->tsk) < 0) {
+		if (binder_sec_transaction(proc->cred,
+					       target_proc->cred) < 0) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPERM;
 			return_error_line = __LINE__;
@@ -3247,7 +3219,11 @@ static void binder_transaction(struct binder_proc *proc,
 	if (target_node && target_node->txn_security_ctx) {
 		size_t added_size;
 
+		#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+		ret = binder_get_secctx(proc->cred, &secctx, &secctx_sz);
+#else
 		ret = binder_get_secctx(proc->tsk, &secctx, &secctx_sz);
+#endif
 		if (ret) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = ret;
@@ -4847,6 +4823,9 @@ static void binder_free_proc(struct binder_proc *proc)
 	}
 	binder_alloc_deferred_release(&proc->alloc);
 	put_task_struct(proc->tsk);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+	put_cred(proc->cred);
+#endif
 	binder_stats_deleted(BINDER_STAT_PROC);
 	kfree(proc);
 }
@@ -5057,7 +5036,7 @@ static int binder_ioctl_set_ctx_mgr(struct file *filp,
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = binder_sec_set_context_mgr(proc->tsk);
+	ret = binder_sec_set_context_mgr(proc->cred);
 	if (ret < 0)
 		goto out;
 	if (uid_valid(context->binder_context_mgr_uid)) {
@@ -5374,6 +5353,9 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	spin_lock_init(&proc->outer_lock);
 	get_task_struct(current->group_leader);
 	proc->tsk = current->group_leader;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+	proc->cred = get_cred(filp->f_cred);
+#endif
 	INIT_LIST_HEAD(&proc->todo);
 	proc->default_priority = task_nice(current);
 	/* binderfs stashes devices in i_private */
