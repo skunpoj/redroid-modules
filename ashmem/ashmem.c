@@ -374,7 +374,11 @@ ashmem_vmfile_get_unmapped_area(struct file *file, unsigned long addr,
 				unsigned long len, unsigned long pgoff,
 				unsigned long flags)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+	return mm_get_unmapped_area(file, addr, len, pgoff, flags);
+#else
 	return mm_get_unmapped_area(current->mm, file, addr, len, pgoff, flags);
+#endif
 }
 
 static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
@@ -414,7 +418,11 @@ static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
 			name = asma->name;
 
 		/* ... and allocate the backing shmem file */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+		vmfile = shmem_file_setup(name, asma->size, vma->flags);
+#else
 		vmfile = shmem_file_setup(name, asma->size, vma->vm_flags);
+#endif
 		if (IS_ERR(vmfile)) {
 			ret = PTR_ERR(vmfile);
 			goto out;
